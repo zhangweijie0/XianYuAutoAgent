@@ -1,17 +1,17 @@
 import re
 from typing import List, Dict
 import os
-from openai import OpenAI
+from anthropic import Anthropic
 from loguru import logger
 
 
 class XianyuReplyBot:
     def __init__(self):
-        # 初始化OpenAI客户端
-        self.client = OpenAI(
-            api_key=os.getenv("API_KEY"),
-            base_url=os.getenv("MODEL_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1"),
-        )
+        # 初始化Anthropic客户端（支持中转站 API）
+        client_kwargs = {"api_key": os.getenv("ANTHROPIC_API_KEY")}
+        if base_url := os.getenv("ANTHROPIC_API_URL"):
+            client_kwargs["base_url"] = base_url
+        self.client = Anthropic(**client_kwargs)
         self._init_system_prompts()
         self._init_agents()
         self.router = IntentRouter(self.agents['classify'])
@@ -220,34 +220,56 @@ class BaseAgent:
         ]
 
     def _call_llm(self, messages: List[Dict], temperature: float = 0.4) -> str:
-        """调用大模型"""
-        response = self.client.chat.completions.create(
-            model=os.getenv("MODEL_NAME", "qwen-max"),
-            messages=messages,
-            temperature=temperature,
+        """调用大模型（Anthropic Claude）"""
+        # Anthropic 要求 system 作为独立参数，从 messages 列表中提取
+        system_prompt = ""
+        user_messages = []
+        for msg in messages:
+            if msg["role"] == "system":
+                system_prompt = msg["content"]
+            else:
+                user_messages.append(msg)
+
+        response = self.client.messages.create(
+            model=os.getenv("MODEL_NAME", "claude-sonnet-4-6"),
             max_tokens=500,
-            top_p=0.8
+            temperature=temperature,
+            system=system_prompt,
+            messages=user_messages
         )
-        return response.choices[0].message.content
+        return response.content[0].text
 
 
 class PriceAgent(BaseAgent):
     """议价处理Agent"""
 
+    def __init__(self, client, system_prompt, safety_filter):
+        super().__init__(client, system_prompt, safety_filter)
+        self.floor_ratio = float(os.getenv("PRICE_FLOOR_RATIO", "0.8"))
+        self.easy_ratio = float(os.getenv("PRICE_EASY_RATIO", "0.9"))
+
+    def _build_price_rules(self) -> str:
+        """根据 .env 配置动态生成议价规则块"""
+        floor_pct = int(self.floor_ratio * 100)
+        easy_pct = int(self.easy_ratio * 100)
+        rules = (
+            "【议价规则 - 以下规则优先级最高，必须严格遵守】\n"
+            f"1. 买家出价 >= 原价{easy_pct}%：直接同意，回复：可以的，按这个价下单吧\n"
+            f"2. 买家出价 {floor_pct}%~{easy_pct}% 之间：可以同意，但说：已经很低了，就这个价吧\n"
+            f"3. 买家出价 < 原价{floor_pct}%：坚决拒绝，说：{floor_pct}折是最低了，再低真的没法出\n"
+            "4. 禁止主动提出比买家报价更低的价格\n"
+        )
+        return rules
+
     def generate(self, user_msg: str, item_desc: str, context: str, bargain_count: int=0) -> str:
         """重写生成逻辑"""
         dynamic_temp = self._calc_temperature(bargain_count)
         messages = self._build_messages(user_msg, item_desc, context)
+        # 将数字议价规则注入到 system prompt 顶部（最高优先级）
+        messages[0]['content'] = self._build_price_rules() + "\n" + messages[0]['content']
         messages[0]['content'] += f"\n▲当前议价轮次：{bargain_count}"
-
-        response = self.client.chat.completions.create(
-            model=os.getenv("MODEL_NAME", "qwen-max"),
-            messages=messages,
-            temperature=dynamic_temp,
-            max_tokens=500,
-            top_p=0.8
-        )
-        return self.safety_filter(response.choices[0].message.content)
+        response = self._call_llm(messages, temperature=dynamic_temp)
+        return self.safety_filter(response)
 
     def _calc_temperature(self, bargain_count: int) -> float:
         """动态温度策略"""
@@ -257,22 +279,10 @@ class PriceAgent(BaseAgent):
 class TechAgent(BaseAgent):
     """技术咨询Agent"""
     def generate(self, user_msg: str, item_desc: str, context: str, bargain_count: int=0) -> str:
-        """重写生成逻辑"""
+        """重写生成逻辑（移除 Qwen 专属的 enable_search，改用基类 _call_llm）"""
         messages = self._build_messages(user_msg, item_desc, context)
-        # messages[0]['content'] += "\n▲知识库：\n" + self._fetch_tech_specs()
-
-        response = self.client.chat.completions.create(
-            model=os.getenv("MODEL_NAME", "qwen-max"),
-            messages=messages,
-            temperature=0.4,
-            max_tokens=500,
-            top_p=0.8,
-            extra_body={
-                "enable_search": True,
-            }
-        )
-
-        return self.safety_filter(response.choices[0].message.content)
+        response = self._call_llm(messages, temperature=0.4)
+        return self.safety_filter(response)
 
 
     # def _fetch_tech_specs(self) -> str:
